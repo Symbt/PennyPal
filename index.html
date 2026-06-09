@@ -951,7 +951,64 @@ canvas.qr-canvas{border-radius:8px;box-shadow:var(--sh)}
 // CONSTANTS
 // ═══════════════════════════════════════════════════════
 
-// ── Storage shim: works in Claude.ai (window.storage) AND as a local file (localStorage) ──
+// ── SUPABASE CLOUD SYNC ──
+// Data saved here is accessible from ANY device at symbt.github.io/PennyPal
+const SUPABASE_URL = 'https://fvnftwezkshyoknonbfp.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_GWPDvBO0jP3_ff-jShOuuw_koJRaaWz';
+
+const _SB = {
+  async upsert(profileId, name, dataStr){
+    try{
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/pennypal_data`, {
+        method: 'POST',
+        headers: {
+          'apikey': SUPABASE_KEY,
+          'Authorization': `Bearer ${SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+          'Prefer': 'resolution=merge-duplicates'
+        },
+        body: JSON.stringify({
+          profile_id: profileId,
+          name: name,
+          data: dataStr,
+          updated_at: new Date().toISOString()
+        })
+      });
+      return res.ok;
+    }catch{return false;}
+  },
+  async get(profileId){
+    try{
+      const res = await fetch(
+        `${SUPABASE_URL}/rest/v1/pennypal_data?profile_id=eq.${encodeURIComponent(profileId)}&select=data,name`,
+        {headers:{'apikey':SUPABASE_KEY,'Authorization':`Bearer ${SUPABASE_KEY}`}}
+      );
+      if(!res.ok)return null;
+      const rows = await res.json();
+      return rows.length ? rows[0] : null;
+    }catch{return null;}
+  },
+  async getAllProfiles(){
+    try{
+      const res = await fetch(
+        `${SUPABASE_URL}/rest/v1/pennypal_data?select=profile_id,name,data`,
+        {headers:{'apikey':SUPABASE_KEY,'Authorization':`Bearer ${SUPABASE_KEY}`}}
+      );
+      if(!res.ok)return null;
+      return await res.json();
+    }catch{return null;}
+  },
+  async delete(profileId){
+    try{
+      await fetch(`${SUPABASE_URL}/rest/v1/pennypal_data?profile_id=eq.${encodeURIComponent(profileId)}`,{
+        method:'DELETE',
+        headers:{'apikey':SUPABASE_KEY,'Authorization':`Bearer ${SUPABASE_KEY}`}
+      });
+    }catch{}
+  }
+};
+
+// ── Storage shim: Claude.ai uses window.storage, everywhere else uses Supabase + localStorage fallback ──
 const _WS = (typeof window.storage !== 'undefined' && typeof window.storage.get === 'function') ? window.storage : null;
 const storage = {
   async get(key){
@@ -1049,22 +1106,108 @@ let moCollapsed = {};
 const PROFILES_KEY = 'pp_profiles';
 function profileDataKey(id){return 'pp_data_'+id;}
 
+// ── Profile registry: stored in localStorage (device-local — just the list of profile IDs + PINs)
+// ── Profile DATA: stored in Supabase (cloud — syncs across all devices)
 async function loadProfiles(){
-  try{const r=await storage.get(PROFILES_KEY);PROFILES=r?JSON.parse(r.value):[];}
-  catch{PROFILES=[];}
+  // Always load profile registry from localStorage first (fast, offline-capable)
+  try{
+    const local = localStorage.getItem(PROFILES_KEY);
+    PROFILES = local ? JSON.parse(local) : [];
+  }catch{PROFILES=[];}
+
+  // If in Claude.ai, also try window.storage
+  if(_WS){
+    try{const r=await _WS.get(PROFILES_KEY);if(r)PROFILES=JSON.parse(r.value);}catch{}
+    return;
+  }
+
+  // On GitHub Pages / local file: merge with any profiles found in Supabase
+  // (so a user who signed up on another device shows up here after first sync)
+  try{
+    const rows = await _SB.getAllProfiles();
+    if(rows && rows.length){
+      rows.forEach(row=>{
+        // Add to local registry if not already there (PIN stays local for security)
+        if(!PROFILES.find(p=>p.id===row.profile_id)){
+          const parsed = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+          const meta = parsed?._profileMeta;
+          if(meta){PROFILES.push(meta);}
+        }
+      });
+      localStorage.setItem(PROFILES_KEY, JSON.stringify(PROFILES));
+    }
+  }catch{}
 }
+
 async function saveProfiles(){
-  try{await storage.set(PROFILES_KEY,JSON.stringify(PROFILES));}catch{}
+  try{localStorage.setItem(PROFILES_KEY, JSON.stringify(PROFILES));}catch{}
+  if(_WS){try{await _WS.set(PROFILES_KEY,JSON.stringify(PROFILES));}catch{}}
 }
+
 async function saveS(){
   if(!ACTIVE_PROFILE)return;
-  try{await storage.set(profileDataKey(ACTIVE_PROFILE.id),JSON.stringify(S));}catch{}
+  // Always save to localStorage for offline access
+  try{localStorage.setItem(profileDataKey(ACTIVE_PROFILE.id), JSON.stringify(S));}catch{}
+  if(_WS){
+    try{await _WS.set(profileDataKey(ACTIVE_PROFILE.id),JSON.stringify(S));}catch{}
+    return;
+  }
+  // Save to Supabase (embed profile meta so other devices can discover it)
+  const payload = {...S, _profileMeta: {
+    id: ACTIVE_PROFILE.id,
+    name: ACTIVE_PROFILE.name,
+    pin: ACTIVE_PROFILE.pin,
+    currency: ACTIVE_PROFILE.currency,
+    accessCode: ACTIVE_PROFILE.accessCode,
+    createdAt: ACTIVE_PROFILE.createdAt
+  }};
+  await _SB.upsert(ACTIVE_PROFILE.id, ACTIVE_PROFILE.name, JSON.stringify(payload));
 }
+
 async function loadProfileData(profileId){
+  // Try localStorage first (fast)
   try{
-    const r=await storage.get(profileDataKey(profileId));
-    return r?JSON.parse(r.value):null;
-  }catch{return null;}
+    const local = localStorage.getItem(profileDataKey(profileId));
+    if(local){
+      const parsed = JSON.parse(local);
+      // Still trigger a background Supabase sync to get latest
+      if(!_WS) syncFromSupabase(profileId, parsed);
+      return parsed;
+    }
+  }catch{}
+
+  if(_WS){
+    try{const r=await _WS.get(profileDataKey(profileId));return r?JSON.parse(r.value):null;}catch{return null;}
+  }
+
+  // No local data — fetch from Supabase (new device, first load)
+  const row = await _SB.get(profileId);
+  if(row){
+    const data = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+    try{localStorage.setItem(profileDataKey(profileId), JSON.stringify(data));}catch{}
+    return data;
+  }
+  return null;
+}
+
+async function syncFromSupabase(profileId, localData){
+  // Background sync: fetch Supabase, use whichever is newer
+  try{
+    const row = await _SB.get(profileId);
+    if(!row)return;
+    const cloudData = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+    // Compare transaction counts as a simple freshness check
+    const cloudTxCount = cloudData?.txs?.length || 0;
+    const localTxCount = localData?.txs?.length || 0;
+    if(cloudTxCount > localTxCount && ACTIVE_PROFILE?.id === profileId){
+      // Cloud is ahead — update local silently
+      delete cloudData._profileMeta;
+      Object.assign(S, cloudData);
+      try{localStorage.setItem(profileDataKey(profileId), JSON.stringify(S));}catch{}
+      renderDash();
+      toast('☁️ Synced latest data from cloud','inf');
+    }
+  }catch{}
 }
 
 function defState(){
@@ -3249,7 +3392,9 @@ function deleteProfile(){
   const id=ACTIVE_PROFILE.id;
   PROFILES=PROFILES.filter(p=>p.id!==id);
   saveProfiles();
+  try{localStorage.removeItem(profileDataKey(id));}catch{}
   try{storage.delete(profileDataKey(id));}catch{}
+  if(!_WS) _SB.delete(id);
   sessionStorage.removeItem('pp_active_id');
   ACTIVE_PROFILE=null;S=null;
   document.getElementById('mainTopbar').style.visibility='hidden';
